@@ -52,6 +52,7 @@ def main(source_dir, tmp_dir):
                     subprocess.check_call(['unrar', 'x', src, tmp_dir], stdout=subprocess.DEVNULL)
                 except:
                     print('RAR couldn\'t be extracted, may be corrupt or not supported by unrar', file=sys.stderr)
+                    continue
             elif archive.lower().endswith('.zip'):
                 mktmp(tmp_dir)
                 src = os.path.join(root, archive)
@@ -85,6 +86,7 @@ def main(source_dir, tmp_dir):
                             print(f'Converted {converted} filenames from {enc} to UTF-8')
                 except zipfile.BadZipFile:
                     print('ZIP couldn\'t be extracted, may be corrupt', file=sys.stderr)
+                    continue
             else:
                 continue
 
