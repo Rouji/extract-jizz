@@ -1,116 +1,224 @@
 #!/usr/bin/env python3
 
 import os
-import sys
-import shutil
-import subprocess
-import zipfile
+from typing import Callable
+from zipfile import ZipFile
 
 import chardet
 from entrypoint2 import entrypoint
+from rarfile import RarFile
+
+CHUNKSIZE = 30 * (1024**2)  # read/write in (up to) 30MiB chunks
 
 
-def safepath(path):
+def safepath(path: str, is_file=False):
+    path = path.rstrip('/')
     nr = 1
-    while os.path.exists(path if nr == 1 else '_'.join([path, str(nr)])):
+    if is_file:
+        spl = os.path.splitext(path)
+
+    def makepath(path):
+        if nr == 1:
+            return path
+        if is_file:
+            return '_'.join([spl[0], str(nr)]) + spl[1]
+        else:
+            return '_'.join([path, str(nr)])
+
+    while True:
+        new = makepath(path)
+        if not os.path.exists(new):
+            break
         nr += 1
-    if nr != 1:
-        return '_'.join([path, str(nr)])
-    return path
+    return new
 
 
-def mktmp(path):
-    try:
-        shutil.rmtree(path)
-    except FileNotFoundError:
-        pass
-    try:
-        os.mkdir(path)
-    except FileExistsError:
-        pass
+class Extractor(object):
+    def __init__(self, archive_path: str):
+        raise NotImplementedError()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        raise NotImplementedError()
+
+    def list_files(self) -> {}:
+        raise NotImplementedError()
+
+    def extract(self,
+                file_name: str,
+                dest_path: str,
+                write_hook: Callable[[bytes], bytes] = None):
+        raise NotImplementedError()
+
+
+class RarFileExtractor(Extractor):
+    def __init__(self, archive_path: str):
+        self.archive_path = archive_path
+        self.rarfile = RarFile(self.archive_path)
+        self.namelist = {i.filename for i in self.rarfile.infolist() if not i.isdir()}
+
+    def __exit__(self, *args):
+        self.rarfile.close()
+
+    def list_files(self) -> {}:
+        return self.namelist
+
+    def extract(self,
+                file_name: str,
+                dest_path: str,
+                write_hook: Callable[[bytes], bytes] = None):
+        with self.rarfile.open(file_name) as rf, open(dest_path, 'wb') as out:
+            while True:
+                chunk = rf.read(CHUNKSIZE)
+                if not chunk:
+                    break
+                out.write(write_hook(chunk) if write_hook else chunk)
+
+
+class ZipFileExtractor(Extractor):
+    def __init__(self, archive_path: str):
+        self.archive_path = archive_path
+        self.zipfile = ZipFile(self.archive_path, 'r')
+
+        # encoding for filenames that aren't utf8
+        # if chardet can't come up with anything, we assume it's shift_jis
+        # TODO: this can fail for archives with few files/files with short names inside
+        names_concat = b''.join([n.encode('cp437', 'ignore') for n in self.zipfile.namelist()])
+        self.filename_encoding = chardet.detect(names_concat).get('encoding') or 'shift_jis'
+
+        # maintain a mapping of converted filenames -> original borked names
+        self.orig_names = {f.filename.encode('cp437', 'ignore').decode(self.filename_encoding, 'ignore'): f.filename
+                           for f in self.zipfile.filelist 
+                           if f.flag_bits & 0x800 == 0}
+
+        self.namelist = {f.filename for f in self.zipfile.filelist if f.flag_bits & 0x800 == 1} | set(self.orig_names.keys())
+        self.namelist = {n for n in self.namelist if not n.endswith('/')}  # filter out directories
+
+    def __exit__(self, *args):
+        self.zipfile.close()
+
+    def list_files(self) -> {}:
+        return self.namelist
+
+    def extract(self,
+                file_name: str,
+                dest_path: str,
+                write_hook: Callable[[bytes], bytes] = None):
+        with self.zipfile.open(self.orig_names.get(file_name, file_name), 'r') as zf, open(dest_path, 'wb') as out:
+            while True:
+                chunk = zf.read(CHUNKSIZE)
+                if not chunk:
+                    break
+                out.write(write_hook(chunk) if write_hook else chunk)
+
+
+class DejizzFilter(object):
+    def __init__(self, encode: str = 'utf-8', decode_default: str = 'shift_jis'):
+        self.detected_encoding = None
+        self.encode = encode
+        self.decode_default = decode_default.lower()
+
+    def dejizz(self, chunk: bytes):
+        if self.detected_encoding is None:
+            det = chardet.detect(chunk[:2048])
+            self.detected_encoding = (det.get('encoding', None) or self.decode_default).lower()
+        if self.detected_encoding == self.encode:
+            return chunk
+        return chunk.decode(self.detected_encoding, 'ignore').encode(self.encode)
 
 
 @entrypoint
-def main(source_dir, tmp_dir):
+def main(source,
+         dejizz_ext='txt,csv,tsv',
+         no_dejizz=False,
+         delete_archives=False,
+         verbose=False,
+         skip=False,
+         overwrite=False,
+         rename=False):
     """Extract ZIP and RAR archives inside a directory recursively while trying to convert ZIP filenames to UTF-8 (using chardetect).
-    WARING: Successfully extracted archives are *deleted* afterwards; if you want to keep them, make a copy first.
-    source_dir: Directory containing archives to be extracted
-    tmp_dir: Directory to use for temporary files (will be created, should not exist beforehand)"""
 
-    if not shutil.which('unrar') or not shutil.which('unzip'):
-        print("This script relies on the 'unrar' and 'unzip' utilities. Please make sure they are properly installed and inside your PATH.", file=sys.stderr)
-        return 1
+    source: Directory containing archives to be extracted (or a single archive file)
+    dejizz_ext: File extensions to try to convert to UTF-8, case insensitive
+    no_dejizz: Don't convert any file contents
+    verbose: Log stuff that's happening
+    skip: Automatically skip extracting files that already exist
+    overwrite: Automatically overwrite existing files
+    rename: Automatically rename extracted files if they already exist"""
 
-    for root, _, files in os.walk(source_dir):
-        for archive in files:
-            if archive.lower().endswith('.rar'):
-                mktmp(tmp_dir)
-                src = os.path.join(root, archive)
-                print(f'Extracting RAR: {src}')
-                # straightforward unrar
-                try:
-                    subprocess.check_call(['unrar', 'x', src, tmp_dir], stdout=subprocess.DEVNULL)
-                except:
-                    print('RAR couldn\'t be extracted, may be corrupt or not supported by unrar', file=sys.stderr)
-                    continue
-            elif archive.lower().endswith('.zip'):
-                mktmp(tmp_dir)
-                src = os.path.join(root, archive)
-                print(f'Extracting ZIP: {src}')
-                try:
-                    with zipfile.ZipFile(src, 'r') as zip:
-                        # ZipFile decodes EVERYTHING that's not utf-8 as cp437
-                        # so you can get back the original bytes by encoding by that...
-                        det = chardet.detect(b''.join([n.encode('cp437', 'ignore') for n in zip.namelist()]))
-                        enc = det['encoding'] if det['encoding'] else 'shift_jis'  # try shit-jizz in case chardetect has no idea
-                        converted = 0
-                        for info in zip.filelist:
-                            filename = info.filename
-                            if info.flag_bits & 0x800 == 0:  # 0x800 indicates utf-8 filenames
-                                converted += 1
-                                filename = info.filename.encode('cp437', 'ignore').decode(enc, 'ignore')
-                            with zip.open(info, 'r') as zipped_file:
-                                outpath = os.path.join(tmp_dir, filename)
-                                outdir = os.path.dirname(outpath)
-                                if not os.path.exists(outdir):
-                                    os.makedirs(outdir)
-                                if os.path.isdir(outpath):
-                                    continue
-                                with open(outpath, 'wb') as out:
-                                    while True:
-                                        chunk = zipped_file.read(1024 ** 2)
-                                        if not chunk:
-                                            break
-                                        out.write(chunk)
-                        if converted > 0:
-                            print(f'Converted {converted} filenames from {enc} to UTF-8')
-                except zipfile.BadZipFile:
-                    print('ZIP couldn\'t be extracted, may be corrupt', file=sys.stderr)
-                    continue
-            else:
+    extractors = {
+        '.zip': ZipFileExtractor,
+        '.rar': RarFileExtractor
+    }
+
+    dejizz_ext = {'.'+spl for spl in dejizz_ext.split(',')}
+
+    def filelist(path):
+        if os.path.isfile(path):
+            return [os.path.split()]
+        else:
+            return [(root, f) for root, _, files in os.walk(path) for f in files]
+
+    # TODO: error out if multiple specified
+    conflict = None
+    if overwrite: conflict = 'o'
+    if rename: conflict = 'r'
+    if skip: conflict = 's'
+
+    files = filelist(source)
+    for root, name in files:
+        splitext = os.path.splitext(name)
+        ext = splitext[1].lower()
+        if ext not in extractors:
+            continue
+        with extractors[ext](os.path.join(root, name)) as extractor:
+            single_root = False  # archive has a single top-level file or dir
+            fl = extractor.list_files()
+            if len(fl) == 0:  # empty (possibly corrupt) archive
                 continue
-
-            # move files from tmp dir to destination
-            extr_files = os.listdir(tmp_dir)
-            if len(extr_files) == 1:
-                dest = safepath(os.path.join(root, extr_files[0]))
-                os.rename(os.path.join(tmp_dir, extr_files[0]), dest)
-            elif len(extr_files) > 1:
-                dest = safepath(os.path.join(root, os.path.splitext(archive)[0]))
-                os.rename(tmp_dir, dest)
+            if len(fl) == 1:
+                single_root = True
             else:
-                continue
+                # TODO: handle backslashes?
+                single_root = len({f.split('/', 1)[0] for f in fl}) <= 1
 
-            # remove original archive
-            try:
-                rm = os.path.join(root, archive)
-                os.unlink(rm)
-                print(f'Deleted {rm}')
-            except:
-                pass
+            extract_root = root if single_root else safepath(os.path.join(root, splitext[0]))
 
-        try:
-            shutil.rmtree(tmp_dir)
-            print(f'Deleted {tmp_dir}')
-        except:
-            pass
+            for f in fl:
+                dest = os.path.join(extract_root, f)
+                if verbose:
+                    print(f'extracting {os.path.join(root, name)}:{f} -> {dest}')
+
+                if os.path.exists(dest):
+                    choice = conflict
+                    if choice is None:
+                        print(f'{dest} already exists.')
+                    while choice not in ['o', 'r', 's']:
+                        choice = input('[S]kip, [o]verwrite, or [r]ename: ')
+                        if not choice:
+                            choice = 's'
+                    if choice == 's':
+                        continue
+                    elif choice == 'r':
+                        dest = safepath(dest)
+
+                try:
+                    os.makedirs(os.path.split(dest)[0])
+                except FileExistsError:
+                    pass
+
+                fext = os.path.splitext(f)[1]
+                dj = fext in dejizz_ext
+                if dj and not no_dejizz:
+                    djfilter = DejizzFilter()
+                extractor.extract(f, dest, write_hook=djfilter.dejizz if dj else None)
+                if dj and verbose and djfilter.detected_encoding != 'utf-8':
+                    print(f'converted from {djfilter.detected_encoding} to UTF-8: {f}')
+
+            if delete_archives:
+                del_arch = os.path.join(root, name)
+                if verbose:
+                    print(f'deleting {del_arch}')
+                os.unlink(del_arch)
