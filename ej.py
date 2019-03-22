@@ -120,6 +120,10 @@ def truncate_utf8(string: str, max_len: int) -> str:
         return string
     return utf8[:max_len].decode('utf-8', 'ignore')
 
+def truncate_utf8_filename(path: str, max_len: int) -> str:
+    '''truncate last part of a path (filename) to a certain length'''
+    split = path.rsplit('/', 1)
+    return '/'.join([split[0], truncate_utf8(split[1], max_len)])
 
 class DejizzFilter(object):
     def __init__(self, encode: str = 'utf-8', decode_default: str = 'shift_jis'):
@@ -151,6 +155,7 @@ def main(source,
     source: Directory containing archives to be extracted (or a single archive file)
     dejizz_ext: File extensions to try to convert to UTF-8, case insensitive
     no_dejizz: Don't convert any file contents
+    delete_archives: Delete archives after extraction
     verbose: Log stuff that's happening
     skip: Automatically skip extracting files that already exist
     overwrite: Automatically overwrite existing files
@@ -197,9 +202,11 @@ def main(source,
             extract_root = root if single_root else safepath(os.path.join(root, splitext[0]))
 
             for f in fl:
-                dest = os.path.join(extract_root, f)
-                if filename_length:
-                    dest = truncate_utf8(dest, int(filename_length))
+                dest = os.path.join(
+                    extract_root,
+                    truncate_utf8_filename(f, int(filename_length)) if filename_length else f
+                )
+
                 if verbose:
                     print(f'extracting {os.path.join(root, name)}:{f} -> {dest}')
 
